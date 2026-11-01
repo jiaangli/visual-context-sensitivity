@@ -1,0 +1,58 @@
+[project]
+name = "prior-transfer"
+version = "0.1.0"
+description = "Context-vs-prior sensitivity in vision-language models: SFT, DAS steering, probing and MetaQuery image reconstruction"
+readme = "README.md"
+license = "CC-BY-NC-4.0"
+license-files = ["LICENSE", "third_party/pyvene/LICENSE"]
+requires-python = ">=3.12.9"
+dependencies = [
+    "accelerate==1.13.0",
+    "bitsandbytes>=0.49.2",
+    "datasets>=4.1.1",
+    "diffusers==0.37.0",
+    "einops>=0.8.2",
+    "matplotlib>=3.10.5",
+    "nnsight>=0.3.6,<0.4",
+    "pandas>=3.0.1",
+    "peft>=0.18.1",
+    "plotly>=6.7.0,<7",
+    "python-dotenv>=1.1.1",
+    "requests==2.33.1",
+    "scikit-image>=0.26.0",
+    "scikit-learn>=1.7.1",
+    "torch==2.10.0",
+    "torchmetrics[image]>=1.8.1",
+    "torchvision>=0.23.0",
+    "transformers==5.10.2",
+    "trl>=0.26.1",
+    "wandb>=0.21.0",
+    "webdataset>=1.0.2",
+]
+
+[tool.pyrefly]
+# check all Python files under the containing directory
+project-includes = ["**/*.py*"]
+# exclude some uninteresting files
+project-excludes = ["**/node_modules", "**/__pycache__", "**/*venv/**", "**/.[!/.]*/**"]
+use-ignore-files = true
+# import project files from "."
+search-path = ["."]
+# let Pyrefly try to guess your search path
+disable-search-path-heuristics = false
+# do not include any third-party packages (except those provided by an interpreter)
+site-package-path = ["./venv"]
+
+# wildcards for which Pyrefly will unconditionally replace the import with `typing.Any`
+replace-imports-with-any = []
+ignore-missing-imports = [""]
+ignore-errors-in-generated-code = false
+untyped-def-behavior = "check-and-infer-return-type"
+permissive-ignores = false
+[project.optional-dependencies]
+cuda = [
+    "xformers>=0.0.33.post2",
+]
+[tool.pyrefly.errors]
+missing-attribute = false
+missing-module-attribute = false

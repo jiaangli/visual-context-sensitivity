@@ -1,0 +1,30 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.pytest_cache/
+
+# Virtual environments and local secrets
+.venv
+.env
+
+# Data, checkpoints and run outputs
+dataset
+checkpoints*
+results
+outputs*
+logs*
+wandb
+runs
+cache
+plots
+projections
+*.log
+*.json
+third_party/pyvene/**/__pycache__/
+third_party/pyvene/**/*.py[oc]
+debug
+knowledge

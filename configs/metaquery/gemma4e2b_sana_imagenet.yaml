@@ -1,0 +1,45 @@
+_gradient_checkpointing: False
+vae_id: "mit-han-lab/dc-ae-lite-f32c32-sana-1.1-diffusers"
+noise_scheduler_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+scheduler_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+mllm_id: "google/gemma-4-E2B-it"
+diffusion_model_id: "Efficient-Large-Model/Sana_600M_512px_diffusers"
+vae_downsample_f: 32
+in_channels: 32
+target_image_size: 512
+per_device_train_batch_size: 32
+dataloader_num_workers: 8
+dataloader_prefetch_factor: 4
+dataloader_persistent_workers: True
+gradient_accumulation_steps: 2
+learning_rate: 0.0004
+eval_strategy: "steps"
+eval_steps: 1000
+eval_on_start: False
+save_strategy: "steps"
+save_steps: 5000
+logging_steps: 50
+warmup_steps: 1000
+num_train_epochs: 1
+max_steps: 10000
+lr_scheduler_type: "cosine_with_min_lr"
+lr_scheduler_kwargs:
+  min_lr_rate: 0.1
+loss_type: "flow"
+num_metaqueries: 0
+llm_layer_idx: -1
+modules_to_freeze:
+  - "vae"
+  - "model.mllm_backbone"
+
+modules_to_unfreeze:
+  - "model.connector"
+  - "model.transformer"
+
+connector_num_hidden_layers: 6
+
+train_datasets:
+  imagenet-1k: 1
+
+eval_dataset: "vlms-are-biased"
+run_name: "gemma4e2b_sana_inet"
