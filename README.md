@@ -217,12 +217,11 @@ images from VLind-Bench, ViLP, Visual CounterFact, VLMs-are-Biased and ROME.
 
 ## 📚 Citation
 
-<!-- TODO: update with the final venue / arXiv identifier. -->
 ```bibtex
 @article{li2026seeing,
-  title   = {Seeing or Knowing? Visual Context Sensitivity in Multimodal Large Language Models},
-  author  = {Li, Jiaang and Li, Chengzu and An, Zhaochong and Yuan, Yifei and Liu, Xi and Belongie, Serge and Sn{\ae}bjarnarson, V{\'e}steinn},
-  journal = {arXiv preprint arXiv:XXXX.XXXXX},
-  year    = {2026}
+  title={Seeing or Knowing? Visual Context Sensitivity in Multimodal Large Language Models},
+  author={Li, Jiaang and Li, Chengzu and An, Zhaochong and Yuan, Yifei and Liu, Xi and Belongie, Serge and Sn{\ae}bjarnarson, V{\'e}steinn},
+  journal={arXiv preprint arXiv:2607.26326},
+  year={2026}
 }
 ```
