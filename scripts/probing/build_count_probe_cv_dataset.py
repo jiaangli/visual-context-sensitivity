@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import json
 import random
+import re
 from collections import Counter, defaultdict
 from collections.abc import Iterable, Sequence
 from pathlib import Path
@@ -17,6 +18,15 @@ DEFAULT_GENERIC_QUESTION = (
     'How many target objects are visible in the image? Answer in the format "Count: N", '
     'where N is the count written in decimal digits (e.g., "Count: 9").'
 )
+DEFAULT_FACTUAL_DIR = "dataset/whatifvis/images/vlms_are_biased_factual"
+PAIRED_SOURCE_DIR = "vlms_are_biased"
+SHARED_FACTUAL_CONCEPTS = ("adidas", "nike")
+CAR_CONCEPTS = ("audi", "maserati", "mercedes_benz")
+# The source dataset has no factual photo of this car. Its one other Mercedes-Benz photo shows a different
+# car, so it is a factual image of the same concept, not an image-level counterpart.
+FACTUAL_STEM_ALIASES = {"mercedes_benz_black_sedan_0": "mercedes"}
+# Its one factual image shows a different scene from every counterfactual image, so it has no real pairs.
+CONCEPTS_WITHOUT_IMAGE_PAIRS = ("adidas",)
 
 
 def sha256_file(path: Path) -> str:
@@ -86,6 +96,33 @@ def dataset_relative_image(path: Path, dataset_root: Path) -> str:
     return "./" + relative.as_posix()
 
 
+def concept_and_factual_stem(image_stem: str) -> tuple[str, str]:
+    """Map a VLMs-are-Biased counterfactual image stem to its concept and factual image stem."""
+
+    base = image_stem.removesuffix("_768")
+    head = base.split("-", 1)[0]
+    if head in SHARED_FACTUAL_CONCEPTS or head.startswith("flag_of_"):
+        return head, head
+    if head in CAR_CONCEPTS:
+        return base, f"{base}_0"
+    animal = re.sub(r"_\d+_\d+$", "", base)
+    return animal, animal
+
+
+def concept_of(row: dict) -> str:
+    """Name the concept a source row shows: an animal species, a car photo, a shoe brand, a flag, or a question."""
+
+    image = Path(str(row["image"]))
+    if image.parent.name == PAIRED_SOURCE_DIR:
+        return concept_and_factual_stem(image.stem)[0]
+    question = re.sub(r"\s*Answer\b.*$", "", str(row["question"])).strip().lower()
+    return f"{image.parent.name}:{question}"
+
+
+def _normalize_stem(stem: str) -> str:
+    return stem.lower().replace("-", "_").replace("gray", "grey")
+
+
 def _representative_index(rows: Sequence[dict]) -> int:
     """Choose one question variant without favoring input order."""
 
@@ -150,7 +187,8 @@ def build_unique_image_rows(
                 "context_answer": str(label),
                 "probe_target": float(label),
                 "probe_label": label,
-                "probe_group_id": f"sha256:{image_digest}",
+                "probe_group_id": f"concept:{concept_of(representative)}",
+                "probe_concept": concept_of(representative),
                 "probe_image_sha256": image_digest,
                 "probe_image_type": "counterfactual",
                 "probe_source_split": representative["_source_split"],
@@ -183,47 +221,169 @@ def build_unique_image_rows(
     return unique_rows, summary
 
 
-def assign_stratified_folds(
+def build_factual_rows(
+    counterfactual_rows: Sequence[dict],
+    *,
+    factual_dir: Path,
+    dataset_root: Path,
+    labels: Sequence[int],
+) -> tuple[list[dict], list[dict], dict]:
+    """Pair retained counterfactual rows with their factual images.
+
+    A factual image's label is the prior answer of its counterfactual rows, since
+    the prior answer is the real-world count that the image shows. Counterfactual
+    rows without a factual image inside the requested labels are excluded.
+
+    Returns the paired counterfactual rows, the factual rows, and a summary.
+    """
+
+    requested_labels = set(labels)
+    factual_paths: dict[str, Path] = {}
+    for path in sorted(factual_dir.iterdir()):
+        if not path.is_file():
+            continue
+        key = _normalize_stem(path.stem)
+        if key in factual_paths:
+            raise ValueError(f"Factual images {factual_paths[key]} and {path} share the key {key!r}")
+        factual_paths[key] = path
+    if not factual_paths:
+        raise FileNotFoundError(f"No factual images found in {factual_dir}")
+
+    rows_by_factual: dict[str, list[dict]] = defaultdict(list)
+    without_factual_source = []
+    without_image_pair = []
+    for row in counterfactual_rows:
+        image = Path(str(row["image"]))
+        if row["probe_concept"] in CONCEPTS_WITHOUT_IMAGE_PAIRS:
+            without_image_pair.append(row["image"])
+            continue
+        if image.parent.name != PAIRED_SOURCE_DIR:
+            without_factual_source.append(row["image"])
+            continue
+        key = _normalize_stem(concept_and_factual_stem(image.stem)[1])
+        key = FACTUAL_STEM_ALIASES.get(key, key)
+        if key not in factual_paths:
+            raise FileNotFoundError(f"No factual image in {factual_dir} for {row['image']}")
+        rows_by_factual[key].append(row)
+
+    paired_rows = []
+    factual_rows = []
+    label_outside_labels = {}
+    for key, paired in sorted(rows_by_factual.items()):
+        priors = {str(row["prior_answer"]).strip() for row in paired}
+        if len(priors) != 1:
+            raise ValueError(f"Factual image {key!r} has conflicting prior answers: {sorted(priors)}")
+        label = int(priors.pop())
+        if label not in requested_labels:
+            label_outside_labels[key] = {"label": label, "counterfactual_images": [row["image"] for row in paired]}
+            continue
+
+        paired_rows.extend(paired)
+        ordered = sorted(paired, key=lambda row: (row["question"], row["image"]))
+        image_digest = sha256_file(factual_paths[key])
+        factual_rows.append(
+            {
+                "question": ordered[0]["question"],
+                "image": dataset_relative_image(factual_paths[key], dataset_root),
+                "context_answer": str(label),
+                "prior_answer": str(label),
+                "response_template": ordered[0].get("response_template"),
+                "statement": None,
+                "probe_target": float(label),
+                "probe_label": label,
+                "probe_group_id": f"concept:{ordered[0]['probe_concept']}",
+                "probe_concept": ordered[0]["probe_concept"],
+                "probe_image_sha256": image_digest,
+                "probe_image_type": "factual",
+                "probe_source_split": "factual",
+                "probe_source_splits": ["factual"],
+                "probe_source_rows": sorted(source for row in paired for source in row["probe_source_rows"]),
+                "probe_collapsed_row_count": 1,
+                "probe_question_variant_count": 1,
+                "probe_sample_weight": 1.0,
+            }
+        )
+
+    if not factual_rows:
+        raise ValueError(f"No factual image from {factual_dir} has a requested label")
+    summary = {
+        "factual_dir": str(factual_dir),
+        "label_rule": "the prior answer of the paired counterfactual rows",
+        "concept_level_pairs": FACTUAL_STEM_ALIASES,
+        "factual_images_available": len(factual_paths),
+        "factual_rows": len(factual_rows),
+        "factual_rows_per_label": dict(sorted(Counter(row["probe_label"] for row in factual_rows).items())),
+        "factual_images_without_retained_counterfactual": sorted(factual_paths.keys() - rows_by_factual.keys()),
+        "counterfactual_rows": len(paired_rows),
+        "excluded_counterfactual_rows": {
+            "no_factual_source": sorted(without_factual_source),
+            "no_image_level_pair": sorted(without_image_pair),
+            "factual_label_outside_requested_labels": label_outside_labels,
+        },
+    }
+    return paired_rows, factual_rows, summary
+
+
+def assign_stratified_group_folds(
     rows: Sequence[dict],
     *,
     n_splits: int,
 ) -> list[dict]:
+    """Assign whole concepts to folds, keeping each label as evenly spread as the concepts allow."""
+
     if n_splits < 2:
         raise ValueError("n_splits must be at least 2")
 
-    rows_by_label: dict[int, list[dict]] = defaultdict(list)
+    rows_by_group: dict[str, list[dict]] = defaultdict(list)
     for row in rows:
-        rows_by_label[int(row["probe_label"])].append(dict(row))
-    too_small = {label: len(items) for label, items in rows_by_label.items() if len(items) < n_splits}
-    if too_small:
-        raise ValueError(f"Every retained label needs at least {n_splits} unique images; found {too_small}")
+        rows_by_group[row["probe_group_id"]].append(dict(row))
 
-    fold_rows: list[list[dict]] = [[] for _ in range(n_splits)]
+    groups_per_label: dict[int, set[str]] = defaultdict(set)
+    for group, group_rows in rows_by_group.items():
+        for row in group_rows:
+            groups_per_label[row["probe_label"]].add(group)
+    too_small = {label: len(groups) for label, groups in groups_per_label.items() if len(groups) < n_splits}
+    if too_small:
+        raise ValueError(f"Every retained label needs at least {n_splits} concepts; found {too_small}")
+
+    label_totals = Counter(row["probe_label"] for row in rows)
+    fold_label_counts = [Counter() for _ in range(n_splits)]
     fold_totals = [0] * n_splits
 
-    for label in sorted(rows_by_label):
-        label_rows = sorted(rows_by_label[label], key=lambda row: row["probe_image_sha256"])
-        random.shuffle(label_rows)
-        base, remainder = divmod(len(label_rows), n_splits)
+    def label_spread(fold: int, group_counts: Counter) -> float:
+        """Mean, over labels, of the variance of each fold's share of that label after adding a group."""
+        spread = 0.0
+        for label, total in label_totals.items():
+            shares = [
+                (fold_label_counts[index][label] + (group_counts[label] if index == fold else 0)) / total
+                for index in range(n_splits)
+            ]
+            mean_share = sum(shares) / n_splits
+            spread += sum((share - mean_share) ** 2 for share in shares) / n_splits
+        return spread / len(label_totals)
+
+    # Place large concepts first, because they constrain the balance most.
+    group_order = sorted(rows_by_group)
+    random.shuffle(group_order)
+    group_order.sort(key=lambda group: len(rows_by_group[group]), reverse=True)
+
+    assigned = []
+    for group in group_order:
+        group_rows = rows_by_group[group]
+        group_counts = Counter(row["probe_label"] for row in group_rows)
         tie_order = list(range(n_splits))
         random.shuffle(tie_order)
-        tie_rank = {fold: rank for rank, fold in enumerate(tie_order)}
-        allocation_order = sorted(range(n_splits), key=lambda fold: (fold_totals[fold], tie_rank[fold]))
-        fold_sizes = {fold: base for fold in range(n_splits)}
-        for fold in allocation_order[:remainder]:
-            fold_sizes[fold] += 1
+        fold = min(
+            range(n_splits),
+            key=lambda index: (round(label_spread(index, group_counts), 12), fold_totals[index], tie_order[index]),
+        )
+        for row in group_rows:
+            row["probe_cv_fold"] = fold
+            row["probe_split"] = "cv"
+            assigned.append(row)
+        fold_label_counts[fold].update(group_counts)
+        fold_totals[fold] += len(group_rows)
 
-        offset = 0
-        for fold in allocation_order:
-            count = fold_sizes[fold]
-            for row in label_rows[offset : offset + count]:
-                row["probe_cv_fold"] = fold
-                row["probe_split"] = "cv"
-                fold_rows[fold].append(row)
-            offset += count
-            fold_totals[fold] += count
-
-    assigned = [row for rows_in_fold in fold_rows for row in rows_in_fold]
     return sorted(assigned, key=lambda row: (row["probe_cv_fold"], row["probe_image_sha256"]))
 
 
@@ -253,9 +413,23 @@ def validate_cv_rows(rows: Sequence[dict], n_splits: int) -> None:
     by_label: dict[int, list[int]] = defaultdict(lambda: [0] * n_splits)
     for row in rows:
         by_label[row["probe_label"]][row["probe_cv_fold"]] += 1
+
+    folds_by_group: dict[str, set[int]] = defaultdict(set)
+    for row in rows:
+        folds_by_group[row["probe_group_id"]].add(row["probe_cv_fold"])
+    split_groups = {group: sorted(folds) for group, folds in folds_by_group.items() if len(folds) > 1}
+    if split_groups:
+        raise AssertionError(f"Concepts span more than one fold: {split_groups}")
     for label, counts in by_label.items():
-        if max(counts) - min(counts) > 1:
-            raise AssertionError(f"Label {label} is not balanced across folds: {counts}")
+        if 0 in counts:
+            raise AssertionError(f"Label {label} is missing from at least one fold: {counts}")
+
+    types_by_group: dict[str, set[str]] = defaultdict(set)
+    for row in rows:
+        types_by_group[row["probe_group_id"]].add(row["probe_image_type"])
+    unpaired_groups = sorted(group for group, types in types_by_group.items() if len(types) != 2)
+    if unpaired_groups:
+        raise AssertionError(f"Concepts lack a factual or counterfactual image: {unpaired_groups}")
 
 
 def write_jsonl(path: Path, rows: Iterable[dict]) -> None:
@@ -273,6 +447,7 @@ def build_and_write(
     labels: Sequence[int],
     n_splits: int,
     seed: int,
+    factual_dir: Path,
     question_template: str | None = None,
 ) -> dict:
     resolved_inputs = {path.resolve() for path in input_paths}
@@ -287,7 +462,15 @@ def build_and_write(
         labels=labels,
         question_template=question_template,
     )
-    assigned_rows = assign_stratified_folds(unique_rows, n_splits=n_splits)
+    counterfactual_rows, factual_rows, pairing = build_factual_rows(
+        unique_rows,
+        factual_dir=factual_dir,
+        dataset_root=dataset_root,
+        labels=labels,
+    )
+    if question_template is not None:
+        factual_rows = [{**row, "question": question_template} for row in factual_rows]
+    assigned_rows = assign_stratified_group_folds(counterfactual_rows + factual_rows, n_splits=n_splits)
     validate_cv_rows(assigned_rows, n_splits)
 
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -305,6 +488,10 @@ def build_and_write(
         test_hashes = {row["probe_image_sha256"] for row in test_rows}
         if train_hashes & test_hashes:
             raise AssertionError(f"Image-content leakage in outer fold {outer_fold}")
+        train_groups = {row["probe_group_id"] for row in train_rows}
+        test_groups = {row["probe_group_id"] for row in test_rows}
+        if train_groups & test_groups:
+            raise AssertionError(f"Concept leakage in outer fold {outer_fold}: {sorted(train_groups & test_groups)}")
 
         fold_dir = output_dir / f"fold_{outer_fold}"
         train_path = fold_dir / "count_cv_train.jsonl"
@@ -320,6 +507,10 @@ def build_and_write(
                 "test_rows": len(test_rows),
                 "train_rows_per_label": dict(sorted(Counter(row["probe_label"] for row in train_rows).items())),
                 "test_rows_per_label": dict(sorted(Counter(row["probe_label"] for row in test_rows).items())),
+                "test_rows_per_image_type": dict(
+                    sorted(Counter(row["probe_image_type"] for row in test_rows).items())
+                ),
+                "test_concepts": len(test_groups),
                 "test_rows_per_source_split": dict(
                     sorted(Counter(row["probe_source_split"] for row in test_rows).items())
                 ),
@@ -332,7 +523,7 @@ def build_and_write(
 
     manifest = {
         "schema_version": 1,
-        "construction": "image-content-unique stratified cross-validation",
+        "construction": "concept-grouped stratified cross-validation over counterfactual and factual images",
         "seed": seed,
         "n_splits": n_splits,
         "labels": sorted(set(labels)),
@@ -347,6 +538,9 @@ def build_and_write(
             ),
             **deduplication,
         },
+        "pairing": pairing,
+        "rows_per_image_type": dict(sorted(Counter(row["probe_image_type"] for row in assigned_rows).items())),
+        "rows_per_label": dict(sorted(Counter(row["probe_label"] for row in assigned_rows).items())),
         "question_policy": {
             "mode": "fixed_generic" if question_template is not None else "source_representative",
             "template": question_template,
@@ -355,7 +549,10 @@ def build_and_write(
         "all_file": str(all_path),
         "folds": fold_summaries,
         "evaluation_protocol": {
-            "outer": (f"{n_splits}-fold stratified cross-validation; each unique image is held out exactly once"),
+            "outer": (
+                f"{n_splits}-fold stratified cross-validation; each unique image is held out exactly once; "
+                "all images of a concept share one fold"
+            ),
             "fit": (
                 "fit the same preregistered linear-probe configuration on the other folds; "
                 "do not select hyperparameters or layers from held-out predictions"
@@ -366,6 +563,9 @@ def build_and_write(
             "The source count_val.jsonl and count_test.jsonl files are read-only and hash-checked.",
             "Every emitted JSONL contains at most one row per image path and per image-content hash.",
             "The same image can appear in training files for other outer folds, as required by cross-validation.",
+            "Every concept has at least one counterfactual and one factual image.",
+            "A concept never appears in both the training and test files of an outer fold.",
+            "Whole concepts are assigned to folds, so per-label fold counts are only approximately equal.",
             "Class balancing belongs to the probe estimator and is not encoded as fold-specific dataset weights.",
             "The no-image and shuffled-image controls must reuse these exact fold assignments.",
             (
@@ -396,6 +596,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Replace every emitted question with one fixed, object-agnostic template",
     )
+    parser.add_argument(
+        "--factual-dir",
+        default=DEFAULT_FACTUAL_DIR,
+        help="Directory of factual images that are paired with VLMs-are-Biased counterfactual images",
+    )
     return parser.parse_args()
 
 
@@ -409,6 +614,7 @@ def main() -> None:
         labels=args.labels,
         n_splits=args.folds,
         seed=args.seed,
+        factual_dir=Path(args.factual_dir),
         question_template=DEFAULT_GENERIC_QUESTION if args.generic_question else None,
     )
     print(json.dumps(manifest, ensure_ascii=False, indent=2))
